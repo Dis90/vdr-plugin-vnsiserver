@@ -570,6 +570,9 @@ bool cVNSIClient::processRequest(cRequestPacket &req)
       result = processRECORDINGS_GetEdl(req);
       break;
 
+    case VNSI_RECORDINGS_SETLASTPLAYEDPOSITION:
+      result = processRECORDINGS_SetLastPlayedPosition(req);
+      break;
 
     /** OPCODE 120 - 139: VNSI network functions for epg access and manipulating */
     case VNSI_EPG_GETFORCHANNEL:
@@ -2302,6 +2305,69 @@ bool cVNSIClient::processRECORDINGS_GetList(cRequestPacket &req) /* OPCODE 102 *
     uint32_t uid = cRecordingsCache::GetInstance().Register(recording, false);
     resp.add_U32(uid);
 
+    if (m_protocolVersion >= 14)
+    {
+      std::string posterUrl = "";
+      std::string fanartUrl = "";
+      int season = 0;
+      int episode = 0;
+      std::string firstAired = "";
+
+      static cPlugin *pTVScraper = cPluginManager::GetPlugin("tvscraper");
+      if (pTVScraper)
+      {
+        cScraperMovieOrTv call;
+        call.recording = recording;
+        call.event = NULL;
+        call.httpImagePaths = true;
+        call.media = false;
+
+        if (pTVScraper->Service("GetScraperMovieOrTv", &call))
+        {
+          if (call.found)
+          {
+            posterUrl = call.posterUrl;
+            fanartUrl = call.fanartUrl;
+            firstAired = call.releaseDate;
+            if (!call.movie)
+            {
+              if (call.episodeFound)
+              {
+                std::string episodeImageUrl = call.episode.episodeImageUrl;
+                if (!episodeImageUrl.empty())
+                  posterUrl = episodeImageUrl;
+
+                season = call.episode.season;
+                episode = call.episode.number;
+                firstAired = call.episode.firstAired;
+              }
+            }
+          }
+        }
+      }
+
+      resp.add_String(posterUrl.c_str());
+      resp.add_String(fanartUrl.c_str());
+      resp.add_U32(season);
+      resp.add_U32(episode);
+      resp.add_String(firstAired.c_str());
+
+      cResumeFile ResumeFile(recording->FileName(), recording->IsPesRecording());
+      int resumePosition = ResumeFile.Read();
+      int fps = recording->FramesPerSecond();
+
+      // If ResumePosition exists add it to video info
+      if (resumePosition > 1)
+      {
+        int resumePositionSecs = resumePosition / fps;
+        resp.add_U32(resumePositionSecs);
+      }
+      else // Unwatched = set position 0
+      {
+        resp.add_U32(0);
+      }
+    }
+
     free(fullname);
   }
 
@@ -2475,6 +2541,49 @@ bool cVNSIClient::processRECORDINGS_GetEdl(cRequestPacket &req) /* OPCODE 105 */
   return true;
 }
 
+bool cVNSIClient::processRECORDINGS_SetLastPlayedPosition(cRequestPacket &req) /* OPCODE 106 */
+{
+  cString recName;
+  const cRecording* recording = nullptr;
+
+  uint32_t uid = req.extract_U32();
+  recording = cRecordingsCache::GetInstance().Lookup(uid);
+  int resumePosition = req.extract_U32();
+
+  DEBUGLOG("SetLastPlayedPosition called: ResumePosition from Kodi %i, Recording \"%s\"", resumePosition, recording->FileName());
+
+  cResponsePacket resp;
+  resp.init(req.getRequestID());
+
+  if (recording)
+  {
+    int fps = recording->FramesPerSecond();
+    cResumeFile ResumeFile(recording->FileName(), recording->IsPesRecording());
+
+    if (resumePosition == 0)
+    {
+      ResumeFile.Delete();
+      DEBUGLOG("SetLastPlayedPosition: ResumePosition 0, ResumeFile deleted, Recording \"%s\" ", recording->FileName());
+    }
+    else if (resumePosition > 0)
+    {
+      int resumePositionFrames = fps * resumePosition;
+      ResumeFile.Save(resumePositionFrames);
+      DEBUGLOG("SetLastPlayedPosition: ResumePosition set to %i, Recording \"%s\"", resumePosition, recording->FileName());
+    }
+    resp.add_U32(VNSI_RET_OK);
+  }
+  else
+  {
+    ERRORLOG("Error in recording name \"%s\"", (const char*)recName);
+    resp.add_U32(VNSI_RET_DATAUNKNOWN);
+  }
+
+  resp.finalise();
+  m_socket.write(resp.getPtr(), resp.getLen());
+
+  return true;
+}
 
 /** OPCODE 120 - 139: VNSI network functions for epg access and manipulating */
 
@@ -2609,6 +2718,114 @@ bool cVNSIClient::processEPG_GetForChannel(cRequestPacket &req) /* OPCODE 120 */
     resp.add_String(m_toUTF8.Convert(thisEventTitle));
     resp.add_String(m_toUTF8.Convert(thisEventSubTitle));
     resp.add_String(m_toUTF8.Convert(thisEventDescription));
+
+    if (m_protocolVersion >= 14)
+    {
+      std::string posterUrl = "";
+      int season = 0;
+      int episode = 0;
+      std::string firstAired = "";
+      int rating = 0;
+      std::string originalTitle = "";
+      std::string actors = "";
+      std::string director = "";
+      std::string writer = "";
+      std::string IMDB_ID = "";
+
+      static cPlugin *pTVScraper = cPluginManager::GetPlugin("tvscraper");
+      if (pTVScraper)
+      {
+        cScraperMovieOrTv call;
+        call.recording = NULL;
+        call.event = event;
+        call.httpImagePaths = true;
+        call.media = false;
+
+        if (pTVScraper->Service("GetScraperMovieOrTv", &call))
+        {
+          if (call.found)
+          {
+            posterUrl = call.posterUrl;
+            firstAired = call.releaseDate;
+            rating = (int)call.voteAverage;
+            originalTitle = call.originalTitle;
+            IMDB_ID = call.IMDB_ID;
+
+            // Actors
+            bool firstActor = true;
+            for (unsigned int i = 0; i < call.actors.size(); i++) {
+              if (!firstActor)
+                actors += ", " + call.actors[i].name;
+              else
+                actors += call.actors[i].name;
+              firstActor = false;
+            }
+
+            if (call.movie)
+            {
+              // Directors
+              bool firstDirector = true;
+              for (unsigned int i = 0; i < call.director.size(); i++) {
+                if (!firstDirector)
+                  director += ", " + call.director[i];
+                else
+                  director += call.director[i];
+                firstDirector = false;
+              }
+              // Writers
+              bool firstWriter = true;
+              for (unsigned int i = 0; i < call.writer.size(); i++) {
+                if (!firstWriter)
+                  writer += ", " + call.writer[i];
+                else
+                  writer += call.writer[i];
+                firstWriter = false;
+              }
+            }
+            else
+            {
+              if (call.episodeFound)
+              {
+                season = call.episode.season;
+                episode = call.episode.number;
+                firstAired = call.episode.firstAired;
+
+                // Directors
+                bool firstDirector = true;
+                for (unsigned int i = 0; i < call.episode.director.size(); i++) {
+                  if (!firstDirector)
+                    director += ", " + call.episode.director[i];
+                  else
+                    director += call.episode.director[i];
+                  firstDirector = false;
+                }
+                // Writers
+                bool firstWriter = true;
+                for (unsigned int i = 0; i < call.episode.writer.size(); i++) {
+                  if (!firstWriter)
+                    writer += ", " + call.episode.writer[i];
+                  else
+                    writer += call.episode.writer[i];
+                  firstWriter = false;
+                }
+              }
+            }
+          }
+        }
+      }
+
+      resp.add_String(posterUrl.c_str());
+      resp.add_U32(season);
+      resp.add_U32(episode);
+      resp.add_String(firstAired.c_str());
+      resp.add_U32(rating);
+      resp.add_String(originalTitle.c_str());
+      resp.add_String(actors.c_str());
+      resp.add_String(director.c_str());
+      resp.add_String(writer.c_str());
+      resp.add_String(IMDB_ID.c_str());
+
+    }
 
     atLeastOneEvent = true;
   }
